@@ -1,0 +1,4 @@
+name: GeminiThinkPatcher
+author: Magstic, Gemini 2.5 Pro
+description: 為 Astrbot 的 Gemini 提供 COT 捕獲功能。
+version: 1.0.0
