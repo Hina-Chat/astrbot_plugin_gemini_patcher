@@ -74,7 +74,6 @@ Powered by Gemini 2.5 Pro, All.
 
 ## 如何使用
 
-1.  將本插件資料夾放入 AstrBot 的 `plugin` 目錄。
-2.  確保您的環境中已安裝 `google-generativeai` 函式庫。
-3.  在 AstrBot 中啟用本插件。
-4.  [Hina Think](https://github.com/Hina-Chat/astrbot_plugin_hina_think) 現在可以透過檢查 `LLMResponse` 實例的 `reasoning_content` 屬性來獲取 Gemini 的思考過程。
+1.  安裝 `google-generativeai` 函式庫；
+2.  安裝本插件，並啟用；
+3.  [Hina Think](https://github.com/Hina-Chat/astrbot_plugin_hina_think) 現在可以透過檢查 `LLMResponse` 實例的 `reasoning_content` 屬性來獲取 Gemini 的思考過程。
