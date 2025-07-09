@@ -6,11 +6,13 @@ Powered by Gemini 2.5 Pro, All.
 
 ## 插件目標
 
-本插件旨在為 AstrBot 的 Gemini (Google GenAI) 模型提供「思考過程」內容的動態提取能力。它透過一種非侵入式的方式，在不修改 AstrBot 核心源碼的前提下，實現了以下目標：
+本插件旨在為 AstrBot 的 Gemini (Google GenAI) 模型提供「非串流思考過程」的動態提取能力。它透過一種非侵入式的方式，在不修改 AstrBot 核心源碼的前提下，實現了以下目標：
 
 -   **功能擴展**：讓 Gemini Provider 能夠請求並解析出模型在生成回答時的內部思考鏈總結 (Chain-of-Thought)。
 -   **插件協同**：允許下游插件（[Hina_Think](https://github.com/Hina-Chat/astrbot_plugin_hina_think)）無縫使用 Gemini 的推理內容，以實現更複雜的應用場景。
 -   **穩定可靠**：解決了在猴子補丁生命週期中因 Python 方法類型機制導致的 `TypeError`，確保插件在啟用、禁用和重載時的絕對穩定性。
+
+請注意：**非串流思考過程僅會輸出『最終步驟』，而非完整的分步過程。**
 
 ## 技術實現：健壯的猴子補丁
 

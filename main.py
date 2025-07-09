@@ -1,32 +1,26 @@
-# V6.0.0 (Refactored for Low Coupling)
-# This version uses a wrapper/decorator pattern instead of full method replacement.
-
-# [!] MAINTAINABILITY NOTE [!]
-# This plugin operates by monkey-patching core methods of AstrBot's `ProviderGoogleGenAI`.
-# It "wraps" the original methods to inject logic before and after their execution.
+# 此版本採用包裝器/裝飾器模式，而非完全取代方法。
 #
-# PROS: This approach is resilient to most upstream changes in `gemini_source.py`,
-# as it does not depend on the internal implementation of the original methods.
+# 此插件透過對 AstrBot 的 `ProviderGoogleGenAI` 核心方法進行猴子補丁（monkey-patching）來運作。
+# 它「包裝」了原始方法，以便在方法執行前後注入邏輯。確保 Gemini 的思考歷程被請求並正確解析，讓下游插件得以擷取。
 #
-# CONS: It still depends on the *signatures* of the patched methods and the *structure*
-# of the objects they accept and return. A major refactoring in AstrBot could still
-# require this plugin to be updated, but the risk is significantly lower.
-# [!] END OF NOTE [!]
+# 優點：這種方法對於 `gemini_source.py` 的多數上游變更具有韌性，因為它不依賴於原始方法的內部實作。
+#
+# 缺點：它仍然依賴於被修補方法的簽章（signatures）以及其接受和回傳物件的結構，AstrBot 的重大重構可能仍需要更新此插件，但風險已顯著降低。
 
 import logging
 
-from astrbot.api.star import Star, register, Context
+from astrbot.api.star import Star, Context
 from astrbot.core.provider.sources.gemini_source import ProviderGoogleGenAI
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.message.message_event_result import MessageChain
 
 logger = logging.getLogger(__name__)
 
-# Attempt to import google types, handle potential errors
+# 嘗試匯入 Google 類型，處理潛在錯誤
 try:
     from google.genai import types
 
-    # A simple check to see if the import was successful and has the expected members.
+    # 一個簡單的檢查，看看匯入是否成功並且具有預期的成員。
     if not hasattr(types, "GenerateContentConfig"):
         raise ImportError(
             "The installed 'google-genai' library is of an incompatible version."
@@ -36,27 +30,27 @@ except ImportError as e:
         f"Failed to import 'google.genai.types' or it's incompatible. GeminiPatcher will be disabled. Error: {e}"
     )
     types = None
-    ProviderGoogleGenAI = None  # Prevent patching if SDK is not available
+    ProviderGoogleGenAI = None  # 若 SDK 無法使用，則不進行修補
 
-# Store original methods
+# 儲存原始方法
 _original_prepare_query_config = None
 _original_process_content_parts = None
 
-# --- Patched Methods (Low-Coupling Wrapper Pattern) ---
+# --- 修補方法 (低耦合包裝模式) ---
 
 
 async def _patched_prepare_query_config(
     self: ProviderGoogleGenAI, *args, **kwargs
 ) -> types.GenerateContentConfig:
     """
-    Patched version of _prepare_query_config using a wrapper approach.
-    It calls the original method and then injects the `thinking_config`.
-    This reduces coupling by not relying on the original method's implementation.
+    採用包裝器方法的 `_prepare_query_config` 修補版本。
+    它會呼叫原始方法，然後注入 `thinking_config`。
+    此作法不依賴原始方法的實作，因而降低了耦合度。
     """
-    # Call the original method to get the base config
+    # 呼叫原始方法以取得基礎設定
     original_config = await _original_prepare_query_config(self, *args, **kwargs)
 
-    # Inject our thinking_config
+    # 注入我們的 thinking_config
     if self.provider_config.get("gm_include_thoughts", True):
         logger.debug("GeminiPatcher: Injecting thinking_config.")
         original_config.thinking_config = types.ThinkingConfig(
@@ -71,15 +65,14 @@ def _patched_process_content_parts(
     result: types.GenerateContentResponse, llm_response: LLMResponse
 ) -> MessageChain:
     """
-    Patched version of _process_content_parts using a wrapper approach.
-    It intercepts the response, extracts thought parts, attaches them to the
-    LLMResponse object, and then passes the cleaned response to the original method.
-    This decouples the plugin from the core logic of how parts are processed.
+    採用包裝器方法的 `_process_content_parts` 修補版本。
+    它會攔截回應，提取思考歷程部分 (thought parts)，將其附加到 LLMResponse 物件，然後將清理後的回應傳遞給原始方法。
+    這將插件與處理內容部分 (parts) 的核心邏輯解耦。
     """
     thinking_text = []
     final_parts = []
 
-    # Safely access and filter parts, separating thoughts from final content
+    # 安全地存取並過濾內容，將思考歷程與最終內容分離
     try:
         original_parts = result.candidates[0].content.parts
         for part in original_parts:
@@ -91,39 +84,23 @@ def _patched_process_content_parts(
             else:
                 final_parts.append(part)
 
-        # Modify the result object in-place to only contain non-thought parts
+        # 就地修改結果物件，使其僅包含非思考歷程的部分
         result.candidates[0].content.parts[:] = final_parts
 
     except (IndexError, AttributeError):
-        # If response is malformed, do nothing and let the original method handle it
+        # 若回應格式有誤，則不做任何處理，並讓原始方法應對
         pass
 
-    # Attach the captured reasoning content to the response object
+    # 將擷取到的思考歷程內容附加到回應物件
     if thinking_text:
         reasoning_content = "\n\n".join(thinking_text)
         logger.debug("GeminiPatcher: Attaching reasoning_content to LLMResponse.")
         setattr(llm_response, "reasoning_content", reasoning_content)
 
-    # Call the original method with the cleaned result, letting it handle all real processing
+    # 呼叫原始方法並傳入清理後的結果，讓它處理所有實際的程序
     return _original_process_content_parts.__func__(result, llm_response)
 
-
-@register(
-    name="astrbot_plugin_gemini_patcher",
-    author="Magstic, Gemini 2.5 Pro",
-    version="1.0",
-    desc="為 Astrbot 的 Gemini 提供 COT 捕獲功能。",
-)
 class GeminiPatcher(Star):
-    """
-    A non-intrusive plugin to monkey-patch the ProviderGoogleGenAI.
-
-    It ensures the Gemini thinking process is requested and correctly parsed,
-    allowing the hina_think plugin to capture it.
-
-    This plugin uses a low-coupling "wrapper" approach, making it more resilient
-    to future updates in AstrBot's core code. See the note at the top of this file.
-    """
 
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
