@@ -53,20 +53,26 @@ async def _patched_prepare_query_config(
     # 注入我們的 thinking_config
     if self.provider_config.get("gm_include_thoughts", True):
         logger.debug("GeminiPatcher: Injecting thinking_config.")
-        original_config.thinking_config = types.ThinkingConfig(
-            include_thoughts=True,
-            thinking_budget=self.provider_config.get("gm_thinking_budget", 2048),
-        )
+        try:
+            original_config.thinking_config = types.ThinkingConfig(
+                include_thoughts=True,
+                thinking_budget=self.provider_config.get("gm_thinking_budget", 2048),
+            )
+        except TypeError:
+            # Fallback for SDKs that don't support include_thoughts param
+            original_config.thinking_config = types.ThinkingConfig(
+                thinking_budget=self.provider_config.get("gm_thinking_budget", 2048),
+            )
 
     return original_config
 
 
 def _patched_process_content_parts(
-    result: types.GenerateContentResponse, llm_response: LLMResponse
+    candidate: types.Candidate, llm_response: LLMResponse
 ) -> MessageChain:
     """
     採用包裝器方法的 `_process_content_parts` 修補版本。
-    它會攔截回應，提取思考歷程部分 (thought parts)，將其附加到 LLMResponse 物件，然後將清理後的回應傳遞給原始方法。
+    它會攔截回應 Candidate，提取思考歷程部分 (thought parts)，將其附加到 LLMResponse 物件，然後將清理後的回應傳遞給原始方法。
     這將插件與處理內容部分 (parts) 的核心邏輯解耦。
     """
     thinking_text = []
@@ -74,9 +80,13 @@ def _patched_process_content_parts(
 
     # 安全地存取並過濾內容，將思考歷程與最終內容分離
     try:
-        original_parts = result.candidates[0].content.parts
+        if not candidate or not getattr(candidate, "content", None):
+            raise AttributeError("Candidate has no content.")
+        original_parts = candidate.content.parts or []
         for part in original_parts:
-            if hasattr(part, "thought") and part.thought and part.text:
+            # 盡可能兼容不同 SDK 版本的思考標記
+            is_thought = bool(getattr(part, "thought", False))
+            if is_thought and getattr(part, "text", None):
                 logger.debug(
                     f"GeminiPatcher: Captured a thought part: '{part.text[:100]}...'"
                 )
@@ -85,7 +95,7 @@ def _patched_process_content_parts(
                 final_parts.append(part)
 
         # 就地修改結果物件，使其僅包含非思考歷程的部分
-        result.candidates[0].content.parts[:] = final_parts
+        candidate.content.parts[:] = final_parts
 
     except (IndexError, AttributeError):
         # 若回應格式有誤，則不做任何處理，並讓原始方法應對
@@ -98,7 +108,7 @@ def _patched_process_content_parts(
         setattr(llm_response, "reasoning_content", reasoning_content)
 
     # 呼叫原始方法並傳入清理後的結果，讓它處理所有實際的程序
-    return _original_process_content_parts.__func__(result, llm_response)
+    return _original_process_content_parts.__func__(candidate, llm_response)
 
 class GeminiPatcher(Star):
 
