@@ -1,24 +1,11 @@
-# V6.0.0 (Refactored for Low Coupling)
-# This version uses a wrapper/decorator pattern instead of full method replacement.
-
-# [!] MAINTAINABILITY NOTE [!]
-# This plugin operates by monkey-patching core methods of AstrBot's `ProviderGoogleGenAI`.
-# It "wraps" the original methods to inject logic before and after their execution.
-#
-# PROS: This approach is resilient to most upstream changes in `gemini_source.py`,
-# as it does not depend on the internal implementation of the original methods.
-#
-# CONS: It still depends on the *signatures* of the patched methods and the *structure*
-# of the objects they accept and return. A major refactoring in AstrBot could still
-# require this plugin to be updated, but the risk is significantly lower.
-# [!] END OF NOTE [!]
-
 import logging
 
-from astrbot.api.star import Star, register, Context
+from astrbot.api.star import Star, Context
 from astrbot.core.provider.sources.gemini_source import ProviderGoogleGenAI
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.message.message_event_result import MessageChain
+from astrbot.api.event import AstrMessageEvent
+import astrbot.core.message.components as Comp
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +13,6 @@ logger = logging.getLogger(__name__)
 try:
     from google.genai import types
 
-    # A simple check to see if the import was successful and has the expected members.
     if not hasattr(types, "GenerateContentConfig"):
         raise ImportError(
             "The installed 'google-genai' library is of an incompatible version."
@@ -38,97 +24,88 @@ except ImportError as e:
     types = None
     ProviderGoogleGenAI = None  # Prevent patching if SDK is not available
 
-# Store original methods
-_original_prepare_query_config = None
-_original_process_content_parts = None
+# --- Store Original Method ---
+_original_text_chat = None
 
-# --- Patched Methods (Low-Coupling Wrapper Pattern) ---
+# --- Patched Method (Forced Streaming) ---
 
-
-async def _patched_prepare_query_config(
-    self: ProviderGoogleGenAI, *args, **kwargs
-) -> types.GenerateContentConfig:
+async def _patched_text_chat(
+    self: ProviderGoogleGenAI,
+    prompt: str,
+    session_id=None,
+    image_urls=None,
+    func_tool=None,
+    contexts=None,
+    system_prompt=None,
+    tool_calls_result=None,
+    model=None,
+    **kwargs,
+) -> LLMResponse:
     """
-    Patched version of _prepare_query_config using a wrapper approach.
-    It calls the original method and then injects the `thinking_config`.
-    This reduces coupling by not relying on the original method's implementation.
+    Patched version of text_chat that forces a streaming approach.
+    It calls the provider's own `text_chat_stream` method and processes the
+    resulting generator to provide hybrid output.
     """
-    # Call the original method to get the base config
-    original_config = await _original_prepare_query_config(self, *args, **kwargs)
+    event: AstrMessageEvent | None = kwargs.get("event")
+    final_response_text = []
+    full_reasoning_content = []
 
-    # Inject our thinking_config
-    if self.provider_config.get("gm_include_thoughts", True):
-        logger.debug("GeminiPatcher: Injecting thinking_config.")
-        original_config.thinking_config = types.ThinkingConfig(
-            include_thoughts=True,
-            thinking_budget=self.provider_config.get("gm_thinking_budget", 2048),
-        )
+    # Force the call to the streaming equivalent
+    stream_generator = self.text_chat_stream(
+        prompt,
+        session_id,
+        image_urls,
+        func_tool,
+        contexts,
+        system_prompt,
+        tool_calls_result,
+        model,
+        **kwargs,
+    )
 
-    return original_config
+    async for resp_chunk in stream_generator:
+        # The stream from gemini_source already separates thoughts in `reasoning_content`
+        if hasattr(resp_chunk, "reasoning_content") and resp_chunk.reasoning_content:
+            thought_text = resp_chunk.reasoning_content
+            full_reasoning_content.append(thought_text)
+            logger.debug(f"GeminiPatcher: Intercepted thought: {thought_text[:100]}...")
+            if event:
+                try:
+                    # Try to send the thought back to the user in real-time
+                    await event.reply(MessageChain(chain=[Comp.Plain(f" {thought_text}")]))
+                except Exception as e:
+                    logger.error(f"GeminiPatcher: Failed to reply with thought: {e}")
+        
+        # Collect the final answer parts
+        if resp_chunk.result_chain:
+            final_response_text.append(resp_chunk.result_chain.get_plain_text())
 
+    # Assemble the final, non-streamed response
+    final_response = LLMResponse("assistant")
+    final_text = "".join(final_response_text).strip()
+    if not final_text:
+        final_text = "(Empty Response)" # Avoid sending empty messages
+    final_response.result_chain = MessageChain(chain=[Comp.Plain(final_text)])
+    
+    # Attach the complete reasoning log for hina_think
+    if full_reasoning_content:
+        setattr(final_response, "reasoning_content", "\n\n".join(full_reasoning_content))
 
-def _patched_process_content_parts(
-    result: types.GenerateContentResponse, llm_response: LLMResponse
-) -> MessageChain:
-    """
-    Patched version of _process_content_parts using a wrapper approach.
-    It intercepts the response, extracts thought parts, attaches them to the
-    LLMResponse object, and then passes the cleaned response to the original method.
-    This decouples the plugin from the core logic of how parts are processed.
-    """
-    thinking_text = []
-    final_parts = []
+    logger.debug("GeminiPatcher: Returning final, assembled, non-streamed answer.")
+    return final_response
 
-    # Safely access and filter parts, separating thoughts from final content
-    try:
-        original_parts = result.candidates[0].content.parts
-        for part in original_parts:
-            if hasattr(part, "thought") and part.thought and part.text:
-                logger.debug(
-                    f"GeminiPatcher: Captured a thought part: '{part.text[:100]}...'"
-                )
-                thinking_text.append(part.text)
-            else:
-                final_parts.append(part)
-
-        # Modify the result object in-place to only contain non-thought parts
-        result.candidates[0].content.parts[:] = final_parts
-
-    except (IndexError, AttributeError):
-        # If response is malformed, do nothing and let the original method handle it
-        pass
-
-    # Attach the captured reasoning content to the response object
-    if thinking_text:
-        reasoning_content = "\n\n".join(thinking_text)
-        logger.debug("GeminiPatcher: Attaching reasoning_content to LLMResponse.")
-        setattr(llm_response, "reasoning_content", reasoning_content)
-
-    # Call the original method with the cleaned result, letting it handle all real processing
-    return _original_process_content_parts.__func__(result, llm_response)
-
-
-@register(
-    name="astrbot_plugin_gemini_patcher",
-    author="Magstic, Gemini 2.5 Pro",
-    version="1.0",
-    desc="為 Astrbot 的 Gemini 提供 COT 捕獲功能。",
-)
 class GeminiPatcher(Star):
     """
-    A non-intrusive plugin to monkey-patch the ProviderGoogleGenAI.
-
-    It ensures the Gemini thinking process is requested and correctly parsed,
-    allowing the hina_think plugin to capture it.
-
-    This plugin uses a low-coupling "wrapper" approach, making it more resilient
-    to future updates in AstrBot's core code. See the note at the top of this file.
+    This plugin forces Gemini to use a streaming-thought process even when
+    global streaming is off. It patches `text_chat` to intercept the call,
+    force a streaming execution, send back thoughts in real-time, and return
+    the final answer as a single response.
     """
 
     def __init__(self, context: Context, config: dict | None = None):
         super().__init__(context)
         self.config = config or {}
-        global _original_prepare_query_config, _original_process_content_parts
+        global _original_text_chat
 
         if ProviderGoogleGenAI is None:
             logger.error(
@@ -136,32 +113,28 @@ class GeminiPatcher(Star):
             )
             return
 
-        logger.info("GeminiPatcherPlugin: Initializing and applying patches...")
+        logger.info("GeminiPatcherPlugin: Initializing and applying force-stream patch...")
 
-        _original_prepare_query_config = ProviderGoogleGenAI._prepare_query_config
-        _original_process_content_parts = ProviderGoogleGenAI.__dict__[
-            "_process_content_parts"
-        ]
+        # Store original method
+        _original_text_chat = ProviderGoogleGenAI.text_chat
 
-        ProviderGoogleGenAI._prepare_query_config = _patched_prepare_query_config
-        ProviderGoogleGenAI._process_content_parts = staticmethod(
-            _patched_process_content_parts
-        )
+        # Apply patch
+        ProviderGoogleGenAI.text_chat = _patched_text_chat
 
         logger.info(
-            "GeminiPatcherPlugin: Patches for _prepare_query_config and _process_content_parts applied successfully."
+            "GeminiPatcherPlugin: Patch for text_chat applied successfully."
         )
 
     async def terminate(self):
-        global _original_prepare_query_config, _original_process_content_parts
+        global _original_text_chat
 
-        if ProviderGoogleGenAI is None or _original_prepare_query_config is None:
+        if ProviderGoogleGenAI is None or _original_text_chat is None:
             logger.info("GeminiPatcherPlugin: No patches to remove.")
             return
 
-        logger.info("GeminiPatcherPlugin: Terminating and removing patches...")
+        logger.info("GeminiPatcherPlugin: Terminating and removing patch...")
 
-        ProviderGoogleGenAI._prepare_query_config = _original_prepare_query_config
-        ProviderGoogleGenAI._process_content_parts = _original_process_content_parts
+        # Restore original method
+        ProviderGoogleGenAI.text_chat = _original_text_chat
 
-        logger.info("GeminiPatcherPlugin: Patches removed successfully.")
+        logger.info("GeminiPatcherPlugin: Patch for text_chat removed successfully.")
